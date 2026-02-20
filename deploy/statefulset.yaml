@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: tinycache
+spec:
+  serviceName: tinycache
+  replicas: 3
+  selector:
+    matchLabels:
+      app: tinycache
+  template:
+    metadata:
+      labels:
+        app: tinycache
+    spec:
+      terminationGracePeriodSeconds: 30
+      initContainers:
+        - name: fix-permissions
+          image: busybox:1.37
+          command: ["sh", "-c", "chown -R 65532:65532 /data"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      containers:
+        - name: tinycache
+          image: tinycache:latest
+          ports:
+            - name: client
+              containerPort: 11211
+            - name: internal
+              containerPort: 11311
+            - name: health
+              containerPort: 9090
+          envFrom:
+            - configMapRef:
+                name: tinycache-config
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              memory: "300Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

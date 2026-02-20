@@ -17,7 +17,7 @@ A distributed, cluster-native in-memory cache implementing the **Memcached text 
 - [Configuration Reference](#configuration-reference)
 - [Memcached Protocol Support](#memcached-protocol-support)
 - [Internal Peer Protocol](#internal-peer-protocol)
-- [Metrics & Observability](#metrics--observability)
+- [Observability](#observability)
 - [Failure Modes](#failure-modes)
 - [Project Structure](#project-structure)
 - [Building & Running Locally](#building--running-locally)
@@ -56,24 +56,22 @@ graph LR
         subgraph n0["tinycache-0"]
             n0c[":11211 client"]
             n0i[":11311 internal"]
-            n0m[":9090 metrics"]
+            n0h[":9090 health"]
             n0p[("PVC /data")]
         end
         subgraph n1["tinycache-1"]
             n1c[":11211 client"]
             n1i[":11311 internal"]
-            n1m[":9090 metrics"]
+            n1h[":9090 health"]
             n1p[("PVC /data")]
         end
         subgraph n2["tinycache-2"]
             n2c[":11211 client"]
             n2i[":11311 internal"]
-            n2m[":9090 metrics"]
+            n2h[":9090 health"]
             n2p[("PVC /data")]
         end
     end
-
-    Prom["Prometheus"]
 
     Client --> n0c
     Client --> n1c
@@ -82,10 +80,6 @@ graph LR
     n0i <--> n1i
     n1i <--> n2i
     n0i <--> n2i
-
-    n0m --> Prom
-    n1m --> Prom
-    n2m --> Prom
 ```
 
 **Ports per node:**
@@ -94,7 +88,7 @@ graph LR
 | ------- | ----------------------------------------------- |
 | `11211` | Memcached client-facing TCP                     |
 | `11311` | Internal peer-to-peer TCP (proxy + replication) |
-| `9090`  | Prometheus metrics + health HTTP endpoints      |
+| `9090`  | Health HTTP endpoints (`/healthz`, `/readyz`)   |
 
 ---
 
@@ -110,9 +104,9 @@ tinycache-{ordinal}.tinycache.{namespace}.svc.cluster.local
 
 Node identity is derived entirely from the `POD_NAME` environment variable (injected by K8s via `fieldRef`). There is no manual peer list. The ring is constructed deterministically from:
 
-- `cluster.replicas` — total number of pods (must match `StatefulSet.spec.replicas`)
-- `cluster.service_name` — headless service name
-- `cluster.namespace` — from `POD_NAMESPACE` env var
+- `TC_CLUSTER_REPLICAS` — total number of pods (must match `StatefulSet.spec.replicas`)
+- `TC_SERVICE_NAME` — headless service name
+- `POD_NAMESPACE` — from K8s `fieldRef: metadata.namespace`
 
 On startup, each node resolves all peer DNS names and blocks readiness until all peers are reachable.
 
@@ -122,7 +116,7 @@ Keys are distributed across nodes using a **consistent hash ring** with virtual 
 
 - Each physical node is mapped to `N` vnodes (default: 150) on the ring
 - Ring is a sorted array of `uint32` vnode hashes, each mapping back to a physical node
-- Key placement: `xxhash(key) mod 2^32` → walk ring clockwise to find primary node
+- Key placement: `fnv-1a(key) mod 2^32` → walk ring clockwise to find primary node
 - Adding/removing a node rebalances only `1/N` of keys on average
 
 **Replica placement:** the `R` replicas for a key are the next `R-1` distinct physical nodes clockwise from the primary on the ring. Virtual nodes of the same physical node are skipped.
@@ -154,7 +148,7 @@ A client may connect to **any** node. The receiving node checks ring ownership:
 - **Local key** → serve from local store directly
 - **Remote key** → proxy the raw command over the internal TCP connection to the primary node, forward response back to client
 
-Proxy connections to peers are maintained as a persistent pool per peer node. If the target node is unreachable, `SERVER_ERROR` is returned immediately — there is no client-transparent retry that could mask a cluster health issue.
+Each proxy request opens a fresh TCP connection to the peer. If the target node is unreachable, `SERVER_ERROR` is returned immediately — there is no client-transparent retry that could mask a cluster health issue.
 
 ---
 
@@ -339,7 +333,7 @@ deploy/
 ├── statefulset.yaml          # 3-replica StatefulSet with PVC template
 ├── headless-service.yaml     # DNS-based peer discovery (clusterIP: None)
 ├── client-service.yaml       # ClusterIP service for client traffic on :11211
-├── configmap.yaml            # tinycache config.yaml
+├── configmap.yaml            # environment variable defaults
 └── poddisruptionbudget.yaml  # maxUnavailable: 1
 ```
 
@@ -351,7 +345,7 @@ deploy/
 - `GET /healthz` (liveness) — process is alive and not deadlocked
 - `GET /readyz` (readiness) — ring initialized, peers reachable, recovery complete
 
-Both are served on the metrics port (`:9090`) to avoid opening an extra listener.
+Both are served on the health port (`:9090`).
 
 ```mermaid
 sequenceDiagram
@@ -371,63 +365,71 @@ Rolling updates proceed one pod at a time. With `replication_factor=3` and `writ
 
 **PodDisruptionBudget:** `maxUnavailable: 1` ensures K8s never voluntarily takes down more than one pod simultaneously (e.g. during node drain), preserving quorum.
 
-**Memory limits:** `cache.max_memory_mb` must be set to a value below the container's memory `limit`. When the threshold is reached, LRU eviction runs before accepting new writes. This prevents OOMKill from losing un-fsynced AOF entries.
+**Memory limits:** `TC_MAX_MEMORY_MB` must be set to a value below the container's memory `limit`. When the threshold is reached, LRU eviction runs before accepting new writes. This prevents OOMKill from losing un-fsynced AOF entries.
 
 ---
 
 ## Configuration Reference
 
-```yaml
-node:
-  addr: "0.0.0.0:11211"           # client-facing TCP
-  internal_addr: "0.0.0.0:11311"  # peer-to-peer TCP
+All configuration is done via **environment variables**. There is no config file. Every variable has a sensible default.
 
-cluster:
-  replicas: 3                      # must match StatefulSet replicas
-  service_name: "tinycache"        # K8s headless service name
-  namespace: "default"             # from POD_NAMESPACE env var
-  replication_factor: 3            # R: total replicas per key
-  write_quorum: 2                  # W: min ACKs to confirm write
-  read_quorum: 1                   # RQ: 1=fast, 2=consistent
-  quorum_timeout_ms: 50            # max wait for replica ACKs
-  virtual_nodes: 150               # vnodes per physical node on ring
-  repair_enabled: true             # async read-repair on version mismatch
+### Kubernetes Identity
 
-cache:
-  max_memory_mb: 256               # triggers LRU eviction when reached
-  default_ttl_seconds: 0           # 0 = no expiry
-  eviction_interval_ms: 500        # TTL expiry scan interval
+| Variable        | Source                         | Default     | Description             |
+| --------------- | ------------------------------ | ----------- | ----------------------- |
+| `POD_NAME`      | `fieldRef: metadata.name`      | `""`        | Node ordinal + identity |
+| `POD_NAMESPACE` | `fieldRef: metadata.namespace` | `"default"` | DNS peer resolution     |
 
-persistence:
-  enabled: true
-  data_dir: "/data"
-  aof:
-    enabled: true
-    fsync: "everysec"              # "always" | "everysec" | "no"
-    max_size_mb: 512               # triggers compaction when exceeded
-  snapshot:
-    enabled: true
-    interval_seconds: 300          # snapshot every 5 minutes
-    min_changes: 1000              # or after 1000 mutations
+### Node
 
-metrics:
-  enabled: true
-  addr: "0.0.0.0:9090"            # also serves /healthz and /readyz
+| Variable           | Default             | Description          |
+| ------------------ | ------------------- | -------------------- |
+| `TC_ADDR`          | `"0.0.0.0:11211"`  | Client-facing TCP    |
+| `TC_INTERNAL_ADDR` | `"0.0.0.0:11311"`  | Peer-to-peer TCP     |
 
-server:
-  shutdown_timeout_seconds: 30
-  max_connections: 10000
-  read_timeout_ms: 5000
-  write_timeout_ms: 5000
-```
+### Cluster
 
-**Environment variables** (injected by K8s, override config):
+| Variable                | Default        | Description                            |
+| ----------------------- | -------------- | -------------------------------------- |
+| `TC_CLUSTER_REPLICAS`   | `3`            | Must match StatefulSet replicas        |
+| `TC_SERVICE_NAME`       | `"tinycache"`  | K8s headless service name              |
+| `TC_REPLICATION_FACTOR` | `3`            | R: total replicas per key              |
+| `TC_WRITE_QUORUM`       | `2`            | W: min ACKs to confirm write           |
+| `TC_READ_QUORUM`        | `1`            | RQ: 1=fast, 2=consistent              |
+| `TC_QUORUM_TIMEOUT_MS`  | `50`           | Max wait for replica ACKs              |
+| `TC_VIRTUAL_NODES`      | `150`          | Vnodes per physical node on ring       |
+| `TC_REPAIR_ENABLED`     | `true`         | Async read-repair on version mismatch  |
 
-| Variable           | Source                         | Used for                |
-| ------------------ | ------------------------------ | ----------------------- |
-| `POD_NAME`         | `fieldRef: metadata.name`      | Node ordinal + identity |
-| `POD_NAMESPACE`    | `fieldRef: metadata.namespace` | DNS peer resolution     |
-| `TINYCACHE_CONFIG` | manual / ConfigMap mount       | Config file path        |
+### Cache
+
+| Variable                   | Default | Description                       |
+| -------------------------- | ------- | --------------------------------- |
+| `TC_MAX_MEMORY_MB`         | `256`   | Triggers LRU eviction when reached|
+| `TC_DEFAULT_TTL_SECONDS`   | `0`     | 0 = no expiry                     |
+| `TC_EVICTION_INTERVAL_MS`  | `500`   | TTL expiry scan interval          |
+
+### Persistence
+
+| Variable                        | Default       | Description                              |
+| ------------------------------- | ------------- | ---------------------------------------- |
+| `TC_PERSISTENCE_ENABLED`        | `true`        | Enable disk persistence                  |
+| `TC_DATA_DIR`                   | `"/data"`     | Data directory for AOF + snapshots       |
+| `TC_AOF_ENABLED`                | `true`        | Enable append-only file                  |
+| `TC_AOF_FSYNC`                  | `"everysec"`  | `"always"` / `"everysec"` / `"no"`      |
+| `TC_AOF_MAX_SIZE_MB`            | `512`         | Max AOF size before compaction           |
+| `TC_SNAPSHOT_ENABLED`           | `true`        | Enable periodic snapshots                |
+| `TC_SNAPSHOT_INTERVAL_SECONDS`  | `300`         | Snapshot every N seconds                 |
+| `TC_SNAPSHOT_MIN_CHANGES`       | `1000`        | Min mutations before snapshot            |
+
+### Server
+
+| Variable                       | Default            | Description                 |
+| ------------------------------ | ------------------ | --------------------------- |
+| `TC_HEALTH_ADDR`               | `"0.0.0.0:9090"`  | Health endpoint listen addr |
+| `TC_SHUTDOWN_TIMEOUT_SECONDS`  | `30`               | Graceful shutdown timeout   |
+| `TC_MAX_CONNECTIONS`           | `10000`            | Max concurrent TCP clients  |
+| `TC_READ_TIMEOUT_MS`           | `5000`             | Per-connection read timeout |
+| `TC_WRITE_TIMEOUT_MS`          | `5000`             | Per-connection write timeout|
 
 ---
 
@@ -464,58 +466,37 @@ These may be added in future versions. The binary protocol is the most likely ne
 
 ## Internal Peer Protocol
 
-Peer-to-peer communication (proxy forwarding and replication) uses a **thin binary framing layer** over TCP on the internal port (`:11311`). This is distinct from the client-facing Memcached text protocol.
+Peer-to-peer communication (proxy forwarding and replication) **reuses the Memcached text protocol** over TCP on the internal port (`:11311`). Each node runs a second TCP server on this port that handles the same command set as the client-facing server, but without routing — commands are always applied to the local store.
 
-The framing carries:
-- The original command payload (forwarded verbatim for proxying)
-- Version metadata (for replication and read-repair comparison)
-- LSN (for AOF coordination)
+This means:
+- Proxy forwarding marshals the client command and sends it verbatim to the owning node's internal port
+- Replication uses `SET` / `DELETE` commands to push writes to replicas
+- Read-repair uses `GETS` to compare versions across nodes
 
-This separation means the internal protocol can evolve independently of the client-facing protocol, and version/LSN fields do not pollute the Memcached wire format.
+The simplicity of reusing the same protocol eliminates an entire class of serialization bugs and makes peer communication trivially debuggable with standard tools like `nc`.
 
 ---
 
-## Metrics & Observability
-
-All metrics are exposed in Prometheus format at `http://<node>:9090/metrics`.
-
-### Counters
-
-| Metric                               | Labels                   | Description                           |
-| ------------------------------------ | ------------------------ | ------------------------------------- |
-| `tinycache_hits_total`               | —                        | Successful GET hits                   |
-| `tinycache_misses_total`             | —                        | GET misses (key not found or expired) |
-| `tinycache_commands_total`           | `command`                | Total commands by type                |
-| `tinycache_proxy_requests_total`     | `target_node`            | Requests proxied to peer              |
-| `tinycache_replication_writes_total` | `target_node`, `status`  | Replication attempts                  |
-| `tinycache_evictions_total`          | `reason` (`ttl`, `lru`)  | Keys evicted                          |
-| `tinycache_aof_writes_total`         | —                        | AOF entries written                   |
-| `tinycache_snapshots_total`          | `status` (`ok`, `error`) | Snapshot completions                  |
-
-### Gauges
-
-| Metric                         | Labels | Description                     |
-| ------------------------------ | ------ | ------------------------------- |
-| `tinycache_keys_total`         | —      | Current number of keys in store |
-| `tinycache_memory_bytes`       | —      | Estimated memory used by store  |
-| `tinycache_connections_active` | —      | Active client connections       |
-| `tinycache_ring_nodes`         | —      | Number of nodes on the ring     |
-
-### Histograms
-
-| Metric                               | Labels                 | Description                   |
-| ------------------------------------ | ---------------------- | ----------------------------- |
-| `tinycache_command_duration_seconds` | `command`              | Command latency               |
-| `tinycache_quorum_duration_seconds`  | `op` (`write`, `read`) | Time to achieve quorum        |
-| `tinycache_proxy_duration_seconds`   | `target_node`          | Peer proxy round-trip latency |
+## Observability
 
 ### Health Endpoints
+
+Served on `:9090` (configurable via `TC_HEALTH_ADDR`):
 
 | Endpoint       | Use                                                                        |
 | -------------- | -------------------------------------------------------------------------- |
 | `GET /healthz` | Liveness: returns `200 OK` if process is alive                             |
-| `GET /readyz`  | Readiness: returns `200 OK` if ring is initialized and peers are reachable |
-| `GET /metrics` | Prometheus metrics scrape                                                  |
+| `GET /readyz`  | Readiness: returns `200 OK` if ring is initialized and recovery is complete|
+
+### Stats
+
+The `stats` Memcached command returns basic node statistics:
+
+```
+STAT curr_items <n>
+STAT bytes <n>
+END
+```
 
 ---
 
@@ -543,41 +524,41 @@ tinycache/
 │       └── main.go                  # Wiring, signal handling, graceful shutdown
 ├── internal/
 │   ├── cache/
-│   │   ├── store.go                 # Sharded in-memory store, CAS, TTL
-│   │   ├── store_test.go
+│   │   ├── iface.go                 # ReadWriter interface (dependency inversion)
+│   │   ├── store.go                 # Sharded in-memory store, CAS, TTL, snapshots
+│   │   ├── persistent.go            # AOF decorator (Single Responsibility)
 │   │   └── eviction.go              # Background TTL + LRU eviction loop
 │   ├── cluster/
-│   │   ├── ring.go                  # Consistent hash ring, vnode placement
-│   │   ├── ring_test.go
+│   │   ├── ring.go                  # Consistent hash ring (FNV-1a), vnode placement
 │   │   ├── node.go                  # Identity from POD_NAME, DNS peer resolution
-│   │   └── router.go                # Route key → local/proxy, peer conn pool
+│   │   ├── router.go                # Route key → local/proxy, forward to peer
+│   │   └── peer_client.go           # Memcached-protocol peer communication
 │   ├── protocol/
 │   │   ├── parser.go                # Memcached text protocol parser
-│   │   ├── parser_test.go
-│   │   └── response.go              # Response builders (STORED, VALUE, ERROR, ...)
+│   │   ├── response.go              # Response builders (STORED, VALUE, ERROR, ...)
+│   │   └── marshal.go               # Command → raw bytes for forwarding
 │   ├── server/
 │   │   ├── tcp.go                   # TCP listener, connection lifecycle
-│   │   └── handler.go               # Command dispatch, quorum coordination
+│   │   ├── handler.go               # Command dispatch, routing, replication
+│   │   └── health.go                # /healthz and /readyz HTTP endpoints
 │   ├── replication/
 │   │   └── replicator.go            # Quorum writes, async tail writes, read-repair
-│   ├── persistence/
-│   │   ├── aof.go                   # AOF writer, fsync modes, LSN tracking
-│   │   ├── aof_reader.go            # AOF replay
-│   │   ├── snapshot.go              # Snapshot writer (background goroutine)
-│   │   ├── snapshot_reader.go       # Snapshot loader
-│   │   ├── lsn.go                   # Atomic LSN counter
-│   │   └── recovery.go              # Startup: load snapshot → replay AOF
-│   └── metrics/
-│       └── prometheus.go            # Collectors, /metrics, /healthz, /readyz
+│   └── persistence/
+│       ├── aof.go                   # AOF writer, fsync modes
+│       ├── aof_reader.go            # AOF replay
+│       ├── snapshot.go              # Snapshot writer
+│       ├── lsn.go                   # Atomic LSN counter
+│       └── recovery.go              # Startup: load snapshot → replay AOF
 ├── config/
-│   └── config.go                    # Config struct, YAML + env parsing
+│   └── config.go                    # Config struct, env-var parsing (os.Getenv)
 ├── deploy/
 │   ├── statefulset.yaml
 │   ├── headless-service.yaml
 │   ├── client-service.yaml
 │   ├── configmap.yaml
 │   └── poddisruptionbudget.yaml
-├── config.example.yaml
+├── compose.yaml                     # Local 3-node cluster
+├── .golangci.yml                    # Linter configuration
 ├── Makefile
 ├── Dockerfile
 └── go.mod
@@ -589,14 +570,14 @@ tinycache/
 
 ### Prerequisites
 
-- Go 1.22+
-- Docker (for containerized local cluster)
+- Go 1.25+
+- Docker & Docker Compose (for containerized local cluster)
 
 ### Build
 
 ```bash
 make build        # builds ./bin/tinycache
-make test         # runs all tests
+make test         # runs all tests with race detector
 make lint         # golangci-lint
 make docker       # builds container image
 ```
@@ -604,14 +585,17 @@ make docker       # builds container image
 ### Local 3-Node Cluster (Docker Compose)
 
 ```bash
-make dev-cluster  # spins up 3 nodes + Prometheus
+docker compose up --build
 ```
 
 Nodes listen on `:11211`, `:11212`, `:11213`. Connect with any Memcached client:
 
 ```bash
-# using memcached CLI
-echo "set foo 0 0 3\r\nbar\r\n" | nc localhost 11211
+# SET a key on node 0
+printf "set foo 0 0 3\r\nbar\r\nquit\r\n" | nc localhost 11211
+
+# GET from node 1 (routing forwards to correct owner)
+printf "get foo\r\nquit\r\n" | nc localhost 11212
 
 # using Python
 python3 -c "
@@ -627,7 +611,7 @@ print(c.get('foo'))
 ```bash
 POD_NAME=tinycache-0 \
 POD_NAMESPACE=default \
-TINYCACHE_CONFIG=./config.example.yaml \
+TC_CLUSTER_REPLICAS=1 \
 ./bin/tinycache
 ```
 
@@ -635,13 +619,17 @@ TINYCACHE_CONFIG=./config.example.yaml \
 
 ## Dependencies
 
-| Package                               | Purpose                                           |
-| ------------------------------------- | ------------------------------------------------- |
-| `github.com/cespare/xxhash/v2`        | Fast non-cryptographic hashing for ring placement |
-| `github.com/prometheus/client_golang` | Prometheus metrics instrumentation                |
-| `gopkg.in/yaml.v3`                    | Configuration file parsing                        |
+**Zero external dependencies.** tinycache uses only the Go standard library:
 
-No external cluster libraries. No service mesh dependency. No sidecar required.
+| Standard Library Package | Replaces                         | Used for                    |
+| ------------------------ | -------------------------------- | --------------------------- |
+| `hash/fnv`               | `xxhash/v2`                      | Consistent hash ring        |
+| `hash/crc32`             | —                                | AOF/snapshot checksums      |
+| `encoding/binary`        | —                                | Binary AOF/snapshot framing |
+| `os.Getenv`              | `gopkg.in/yaml.v3`              | Configuration               |
+| `net/http`               | `prometheus/client_golang`       | Health endpoints            |
+
+No external modules. No service mesh dependency. No sidecar required. `go.sum` is empty.
 
 ---
 

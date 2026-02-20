@@ -142,3 +142,10 @@ config.yaml
 
 # node
 node_modules/
+
+# tinycache build artifacts
+bin/
+tinycache
+
+# AOF / persistence logs from local dev
+*.log

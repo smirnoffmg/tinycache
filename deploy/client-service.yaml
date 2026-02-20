@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: tinycache-client
+  labels:
+    app: tinycache
+spec:
+  type: ClusterIP
+  selector:
+    app: tinycache
+  ports:
+    - name: memcached
+      port: 11211
+      targetPort: 11211

@@ -1,0 +1,80 @@
+x-common-env: &common-env
+  TC_ADDR: "0.0.0.0:11211"
+  TC_INTERNAL_ADDR: "0.0.0.0:11311"
+  TC_CLUSTER_REPLICAS: "3"
+  TC_SERVICE_NAME: "tinycache"
+  TC_REPLICATION_FACTOR: "3"
+  TC_WRITE_QUORUM: "2"
+  TC_READ_QUORUM: "1"
+  TC_QUORUM_TIMEOUT_MS: "50"
+  TC_VIRTUAL_NODES: "150"
+  TC_MAX_MEMORY_MB: "64"
+  TC_EVICTION_INTERVAL_MS: "500"
+  TC_PERSISTENCE_ENABLED: "true"
+  TC_DATA_DIR: "/data"
+  TC_AOF_ENABLED: "true"
+  TC_AOF_FSYNC: "everysec"
+  TC_SNAPSHOT_ENABLED: "true"
+  TC_SNAPSHOT_INTERVAL_SECONDS: "300"
+  TC_HEALTH_ADDR: "0.0.0.0:9090"
+  TC_SHUTDOWN_TIMEOUT_SECONDS: "10"
+  TC_MAX_CONNECTIONS: "1000"
+  TC_READ_TIMEOUT_MS: "5000"
+  TC_WRITE_TIMEOUT_MS: "5000"
+  POD_NAMESPACE: "default"
+
+x-common: &common
+  build: .
+  restart: unless-stopped
+
+services:
+  tinycache-0:
+    <<: *common
+    container_name: tinycache-0
+    environment:
+      <<: *common-env
+      POD_NAME: "tinycache-0"
+    ports:
+      - "11211:11211"
+      - "9090:9090"
+    tmpfs:
+      - /data:uid=65532,gid=65532
+    networks:
+      cluster:
+        aliases:
+          - tinycache-0.tinycache.default.svc.cluster.local
+
+  tinycache-1:
+    <<: *common
+    container_name: tinycache-1
+    environment:
+      <<: *common-env
+      POD_NAME: "tinycache-1"
+    ports:
+      - "11212:11211"
+      - "9091:9090"
+    tmpfs:
+      - /data:uid=65532,gid=65532
+    networks:
+      cluster:
+        aliases:
+          - tinycache-1.tinycache.default.svc.cluster.local
+
+  tinycache-2:
+    <<: *common
+    container_name: tinycache-2
+    environment:
+      <<: *common-env
+      POD_NAME: "tinycache-2"
+    ports:
+      - "11213:11211"
+      - "9092:9090"
+    tmpfs:
+      - /data:uid=65532,gid=65532
+    networks:
+      cluster:
+        aliases:
+          - tinycache-2.tinycache.default.svc.cluster.local
+
+networks:
+  cluster:
