@@ -6,8 +6,38 @@ A distributed, cluster-native in-memory cache implementing the **Memcached text 
 
 ---
 
+## Why tinycache over Memcached?
+
+Memcached is battle-tested, extremely fast, and perfectly fine for pure ephemeral caching. tinycache fills the gap between "pure cache" and "distributed database" for teams that need resilience without changing client code.
+
+|                     | Memcached                            | tinycache                                                              |
+| ------------------- | ------------------------------------ | ---------------------------------------------------------------------- |
+| **Replication**     | None                                 | R=3, W=2 quorum — node crash doesn't lose data                         |
+| **Persistence**     | None                                 | AOF + snapshots — warm restarts, no cache stampede on rolling updates  |
+| **Routing**         | Client-side consistent hashing       | Server-side — connect to any node, cluster handles key placement       |
+| **Node failure**    | All keys on that node lost instantly | Replicas serve those keys; node recovers from disk                     |
+| **CAS safety**      | Per-node, depends on client routing  | Routed to primary server-side, replicated — safe for distributed locks |
+| **K8s integration** | Bolted on (operators, sidecars)      | Native StatefulSet identity, health probes, graceful shutdown          |
+| **Dependencies**    | C, libevent                          | Go stdlib only — single static binary, zero external modules           |
+
+### Where tinycache shines
+
+- **Session storage** — a node crash doesn't log users out; replicas still hold the session, and the restarted node recovers from AOF
+- **Polyglot environments** — server-side routing means Go, Python, and Node services don't need to agree on a consistent-hashing library
+- **Rolling deployments** — persistence prevents thundering-herd cache misses during `kubectl rollout restart`
+- **Distributed locks via CAS** — server-side routing to the primary eliminates split-brain lock acquisition from ring inconsistency
+
+### When to just use Memcached
+
+- Pure ephemeral caching where loss is cheap and your system handles misses gracefully
+- Extreme throughput requirements where C's raw performance matters (~2-3x faster at high QPS)
+- You already have a mature Memcached deployment and the marginal resilience gains aren't worth the migration risk
+
+---
+
 ## Table of Contents
 
+- [Why tinycache over Memcached?](#why-tinycache-over-memcached)
 - [Guiding Principles](#guiding-principles)
 - [Architecture Overview](#architecture-overview)
 - [Cluster Topology](#cluster-topology)
@@ -382,54 +412,54 @@ All configuration is done via **environment variables**. There is no config file
 
 ### Node
 
-| Variable           | Default             | Description          |
-| ------------------ | ------------------- | -------------------- |
-| `TC_ADDR`          | `"0.0.0.0:11211"`  | Client-facing TCP    |
-| `TC_INTERNAL_ADDR` | `"0.0.0.0:11311"`  | Peer-to-peer TCP     |
+| Variable           | Default           | Description       |
+| ------------------ | ----------------- | ----------------- |
+| `TC_ADDR`          | `"0.0.0.0:11211"` | Client-facing TCP |
+| `TC_INTERNAL_ADDR` | `"0.0.0.0:11311"` | Peer-to-peer TCP  |
 
 ### Cluster
 
-| Variable                | Default        | Description                            |
-| ----------------------- | -------------- | -------------------------------------- |
-| `TC_CLUSTER_REPLICAS`   | `3`            | Must match StatefulSet replicas        |
-| `TC_SERVICE_NAME`       | `"tinycache"`  | K8s headless service name              |
-| `TC_REPLICATION_FACTOR` | `3`            | R: total replicas per key              |
-| `TC_WRITE_QUORUM`       | `2`            | W: min ACKs to confirm write           |
-| `TC_READ_QUORUM`        | `1`            | RQ: 1=fast, 2=consistent              |
-| `TC_QUORUM_TIMEOUT_MS`  | `50`           | Max wait for replica ACKs              |
-| `TC_VIRTUAL_NODES`      | `150`          | Vnodes per physical node on ring       |
-| `TC_REPAIR_ENABLED`     | `true`         | Async read-repair on version mismatch  |
+| Variable                | Default       | Description                           |
+| ----------------------- | ------------- | ------------------------------------- |
+| `TC_CLUSTER_REPLICAS`   | `3`           | Must match StatefulSet replicas       |
+| `TC_SERVICE_NAME`       | `"tinycache"` | K8s headless service name             |
+| `TC_REPLICATION_FACTOR` | `3`           | R: total replicas per key             |
+| `TC_WRITE_QUORUM`       | `2`           | W: min ACKs to confirm write          |
+| `TC_READ_QUORUM`        | `1`           | RQ: 1=fast, 2=consistent              |
+| `TC_QUORUM_TIMEOUT_MS`  | `50`          | Max wait for replica ACKs             |
+| `TC_VIRTUAL_NODES`      | `150`         | Vnodes per physical node on ring      |
+| `TC_REPAIR_ENABLED`     | `true`        | Async read-repair on version mismatch |
 
 ### Cache
 
-| Variable                   | Default | Description                       |
-| -------------------------- | ------- | --------------------------------- |
-| `TC_MAX_MEMORY_MB`         | `256`   | Triggers LRU eviction when reached|
-| `TC_DEFAULT_TTL_SECONDS`   | `0`     | 0 = no expiry                     |
-| `TC_EVICTION_INTERVAL_MS`  | `500`   | TTL expiry scan interval          |
+| Variable                  | Default | Description                        |
+| ------------------------- | ------- | ---------------------------------- |
+| `TC_MAX_MEMORY_MB`        | `256`   | Triggers LRU eviction when reached |
+| `TC_DEFAULT_TTL_SECONDS`  | `0`     | 0 = no expiry                      |
+| `TC_EVICTION_INTERVAL_MS` | `500`   | TTL expiry scan interval           |
 
 ### Persistence
 
-| Variable                        | Default       | Description                              |
-| ------------------------------- | ------------- | ---------------------------------------- |
-| `TC_PERSISTENCE_ENABLED`        | `true`        | Enable disk persistence                  |
-| `TC_DATA_DIR`                   | `"/data"`     | Data directory for AOF + snapshots       |
-| `TC_AOF_ENABLED`                | `true`        | Enable append-only file                  |
-| `TC_AOF_FSYNC`                  | `"everysec"`  | `"always"` / `"everysec"` / `"no"`      |
-| `TC_AOF_MAX_SIZE_MB`            | `512`         | Max AOF size before compaction           |
-| `TC_SNAPSHOT_ENABLED`           | `true`        | Enable periodic snapshots                |
-| `TC_SNAPSHOT_INTERVAL_SECONDS`  | `300`         | Snapshot every N seconds                 |
-| `TC_SNAPSHOT_MIN_CHANGES`       | `1000`        | Min mutations before snapshot            |
+| Variable                       | Default      | Description                        |
+| ------------------------------ | ------------ | ---------------------------------- |
+| `TC_PERSISTENCE_ENABLED`       | `true`       | Enable disk persistence            |
+| `TC_DATA_DIR`                  | `"/data"`    | Data directory for AOF + snapshots |
+| `TC_AOF_ENABLED`               | `true`       | Enable append-only file            |
+| `TC_AOF_FSYNC`                 | `"everysec"` | `"always"` / `"everysec"` / `"no"` |
+| `TC_AOF_MAX_SIZE_MB`           | `512`        | Max AOF size before compaction     |
+| `TC_SNAPSHOT_ENABLED`          | `true`       | Enable periodic snapshots          |
+| `TC_SNAPSHOT_INTERVAL_SECONDS` | `300`        | Snapshot every N seconds           |
+| `TC_SNAPSHOT_MIN_CHANGES`      | `1000`       | Min mutations before snapshot      |
 
 ### Server
 
-| Variable                       | Default            | Description                 |
-| ------------------------------ | ------------------ | --------------------------- |
-| `TC_HEALTH_ADDR`               | `"0.0.0.0:9090"`  | Health endpoint listen addr |
-| `TC_SHUTDOWN_TIMEOUT_SECONDS`  | `30`               | Graceful shutdown timeout   |
-| `TC_MAX_CONNECTIONS`           | `10000`            | Max concurrent TCP clients  |
-| `TC_READ_TIMEOUT_MS`           | `5000`             | Per-connection read timeout |
-| `TC_WRITE_TIMEOUT_MS`          | `5000`             | Per-connection write timeout|
+| Variable                      | Default          | Description                  |
+| ----------------------------- | ---------------- | ---------------------------- |
+| `TC_HEALTH_ADDR`              | `"0.0.0.0:9090"` | Health endpoint listen addr  |
+| `TC_SHUTDOWN_TIMEOUT_SECONDS` | `30`             | Graceful shutdown timeout    |
+| `TC_MAX_CONNECTIONS`          | `10000`          | Max concurrent TCP clients   |
+| `TC_READ_TIMEOUT_MS`          | `5000`           | Per-connection read timeout  |
+| `TC_WRITE_TIMEOUT_MS`         | `5000`           | Per-connection write timeout |
 
 ---
 
@@ -483,10 +513,10 @@ The simplicity of reusing the same protocol eliminates an entire class of serial
 
 Served on `:9090` (configurable via `TC_HEALTH_ADDR`):
 
-| Endpoint       | Use                                                                        |
-| -------------- | -------------------------------------------------------------------------- |
-| `GET /healthz` | Liveness: returns `200 OK` if process is alive                             |
-| `GET /readyz`  | Readiness: returns `200 OK` if ring is initialized and recovery is complete|
+| Endpoint       | Use                                                                         |
+| -------------- | --------------------------------------------------------------------------- |
+| `GET /healthz` | Liveness: returns `200 OK` if process is alive                              |
+| `GET /readyz`  | Readiness: returns `200 OK` if ring is initialized and recovery is complete |
 
 ### Stats
 
@@ -621,13 +651,13 @@ TC_CLUSTER_REPLICAS=1 \
 
 **Zero external dependencies.** tinycache uses only the Go standard library:
 
-| Standard Library Package | Replaces                         | Used for                    |
-| ------------------------ | -------------------------------- | --------------------------- |
-| `hash/fnv`               | `xxhash/v2`                      | Consistent hash ring        |
-| `hash/crc32`             | —                                | AOF/snapshot checksums      |
-| `encoding/binary`        | —                                | Binary AOF/snapshot framing |
-| `os.Getenv`              | `gopkg.in/yaml.v3`              | Configuration               |
-| `net/http`               | `prometheus/client_golang`       | Health endpoints            |
+| Standard Library Package | Replaces                   | Used for                    |
+| ------------------------ | -------------------------- | --------------------------- |
+| `hash/fnv`               | `xxhash/v2`                | Consistent hash ring        |
+| `hash/crc32`             | —                          | AOF/snapshot checksums      |
+| `encoding/binary`        | —                          | Binary AOF/snapshot framing |
+| `os.Getenv`              | `gopkg.in/yaml.v3`         | Configuration               |
+| `net/http`               | `prometheus/client_golang` | Health endpoints            |
 
 No external modules. No service mesh dependency. No sidecar required. `go.sum` is empty.
 
