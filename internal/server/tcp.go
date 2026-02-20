@@ -83,6 +83,10 @@ func (s *TCPServer) handleConn(conn net.Conn) {
 		s.wg.Done()
 	}()
 
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+	}
+
 	r := bufio.NewReader(conn)
 	w := bufio.NewWriter(conn)
 

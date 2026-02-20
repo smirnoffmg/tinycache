@@ -1,0 +1,24 @@
+services:
+  tinycache:
+    build: .
+    container_name: bench-tinycache
+    environment:
+      POD_NAME: "tinycache-0"
+      POD_NAMESPACE: "default"
+      TC_ADDR: "0.0.0.0:11211"
+      TC_INTERNAL_ADDR: "0.0.0.0:11311"
+      TC_CLUSTER_REPLICAS: "1"
+      TC_SERVICE_NAME: "tinycache"
+      TC_MAX_MEMORY_MB: "64"
+      TC_PERSISTENCE_ENABLED: "false"
+      TC_HEALTH_ADDR: "0.0.0.0:9090"
+      TC_MAX_CONNECTIONS: "10000"
+    ports:
+      - "11211:11211"
+
+  memcached:
+    image: memcached:1.6-alpine
+    container_name: bench-memcached
+    command: ["memcached", "-m", "64", "-c", "10000"]
+    ports:
+      - "11212:11211"
